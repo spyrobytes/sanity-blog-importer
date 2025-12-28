@@ -1,0 +1,21 @@
+{
+  "name": "hlyx-blog-cli",
+  "version": "1.0.0",
+  "description": "Headless CLI for importing Markdown posts into Sanity CMS",
+  "type": "module",
+  "scripts": {
+    "import": "node scripts/import-posts.mjs",
+    "check": "node scripts/import-posts.mjs --check"
+  },
+  "keywords": ["sanity", "markdown", "cli", "blog"],
+  "author": "Helixbytes Digital Solutions",
+  "license": "ISC",
+  "dependencies": {
+    "@portabletext/markdown": "^1.1.1",
+    "@sanity/client": "^7.13.2",
+    "dotenv": "^17.2.3",
+    "glob": "^11.0.0",
+    "gray-matter": "^4.0.3",
+    "mime": "^4.0.4"
+  }
+}
