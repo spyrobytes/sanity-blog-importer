@@ -54,7 +54,7 @@ const {
   SANITY_PROJECT_ID,
   SANITY_DATASET,
   SANITY_TOKEN,
-  SANITY_API_VERSION = "2024-01-01",
+  SANITY_API_VERSION = "2025-12-14",
   POSTS_DIR = "./content/posts",
 } = process.env;
 
@@ -68,7 +68,18 @@ const WRITE = args.includes("--write");
 const CHECK = args.includes("--check");
 const DRAFT = args.includes("--draft");
 const onlyIdx = args.indexOf("--only");
-const ONLY = onlyIdx >= 0 ? args[onlyIdx + 1] : null;
+
+// Validate --only argument: must have a value that isn't another flag
+let ONLY = null;
+if (onlyIdx >= 0) {
+  const onlyValue = args[onlyIdx + 1];
+  if (!onlyValue || onlyValue.startsWith("--")) {
+    console.error("Error: --only requires a slug argument");
+    console.error("Usage: node import-posts.mjs --only <slug>");
+    process.exit(1);
+  }
+  ONLY = onlyValue;
+}
 
 const client = createClient({
   projectId: SANITY_PROJECT_ID,
@@ -104,11 +115,16 @@ function generateKey() {
 }
 
 function slugify(input) {
-  return String(input || "")
+  const slug = String(input || "")
     .trim()
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/(^-|-$)/g, "");
+
+  if (!slug) {
+    throw new Error(`Cannot generate valid slug from input: "${input}"`);
+  }
+  return slug;
 }
 
 /**
@@ -144,6 +160,53 @@ function makeDocumentId(type, slug) {
   return DRAFT ? `drafts.${baseId}` : baseId;
 }
 
+/**
+ * Retry wrapper for async operations with exponential backoff.
+ * Retries on transient network errors and server errors (5xx).
+ */
+async function withRetry(fn, { maxRetries = 3, baseDelay = 1000, context = "operation" } = {}) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const isRetryable =
+        err.statusCode >= 500 ||
+        err.code === "ECONNRESET" ||
+        err.code === "ETIMEDOUT" ||
+        err.code === "ENOTFOUND" ||
+        err.code === "ECONNREFUSED" ||
+        err.message?.includes("socket hang up");
+
+      if (attempt === maxRetries || !isRetryable) {
+        throw err;
+      }
+
+      const delay = baseDelay * Math.pow(2, attempt - 1);
+      console.log(`  [retry] ${context}: attempt ${attempt + 1}/${maxRetries} in ${delay}ms...`);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+}
+
+/**
+ * Read a file with descriptive error handling.
+ * Wraps fs.readFileSync to provide better context on failure.
+ */
+function readFileWithContext(filePath, context, encoding = null) {
+  try {
+    return encoding ? fs.readFileSync(filePath, encoding) : fs.readFileSync(filePath);
+  } catch (err) {
+    const code = err.code || "UNKNOWN";
+    const details = {
+      ENOENT: "file not found",
+      EACCES: "permission denied",
+      EMFILE: "too many open files",
+      EISDIR: "path is a directory",
+    }[code] || err.message;
+    throw new Error(`Failed to read ${context}: ${filePath} (${code}: ${details})`);
+  }
+}
+
 // ------------------------------
 // Image asset upload with dedupe
 // ------------------------------
@@ -159,35 +222,65 @@ function makeDocumentId(type, slug) {
 const assetCache = new Map();
 
 /**
+ * Track in-flight upload promises to prevent race conditions.
+ * Multiple concurrent calls for the same path will share a single upload.
+ */
+const uploadPromises = new Map();
+
+/**
  * Upload a local image file into Sanity as an image asset.
  * Returns the asset document (at least contains _id).
  *
  * In dry-run mode, we do not upload; we return a synthetic id for continuity.
+ *
+ * Race condition protection: If an upload is already in progress for the same
+ * path, returns the existing promise instead of starting a duplicate upload.
  */
 async function uploadImageAsset(absPath) {
+  // Check completed cache first
   if (assetCache.has(absPath)) {
     return { _id: assetCache.get(absPath) };
   }
 
-  // Validate image type before reading
-  const contentType = validateImageType(absPath);
-
-  const buf = fs.readFileSync(absPath);
-  const filename = path.basename(absPath);
-
-  if (!WRITE) {
-    // Dry-run: do not upload. Still cache a deterministic-ish id so repeated
-    // references reuse the same fake asset id during this run.
-    const fakeId = `dry.asset.${slugify(filename)}`;
-    assetCache.set(absPath, fakeId);
-    console.log(`  [dry] would upload image asset: ${path.basename(absPath)}`);
-    return { _id: fakeId };
+  // Check for in-flight upload (race condition prevention)
+  if (uploadPromises.has(absPath)) {
+    return uploadPromises.get(absPath);
   }
 
-  const asset = await client.assets.upload("image", buf, { filename, contentType });
-  assetCache.set(absPath, asset._id);
-  console.log(`  [upload] ${path.basename(absPath)} -> ${asset._id}`);
-  return asset; // includes _id
+  // Create the upload promise and track it
+  const uploadPromise = (async () => {
+    // Validate image type before reading
+    const contentType = validateImageType(absPath);
+
+    const buf = readFileWithContext(absPath, "image asset");
+    const filename = path.basename(absPath);
+
+    if (!WRITE) {
+      // Dry-run: do not upload. Still cache a deterministic-ish id so repeated
+      // references reuse the same fake asset id during this run.
+      const fakeId = `dry.asset.${slugify(filename)}`;
+      assetCache.set(absPath, fakeId);
+      console.log(`  [dry] would upload image asset: ${path.basename(absPath)}`);
+      return { _id: fakeId };
+    }
+
+    const asset = await withRetry(
+      () => client.assets.upload("image", buf, { filename, contentType }),
+      { context: `upload ${filename}` }
+    );
+    assetCache.set(absPath, asset._id);
+    console.log(`  [upload] ${path.basename(absPath)} -> ${asset._id}`);
+    return asset; // includes _id
+  })();
+
+  uploadPromises.set(absPath, uploadPromise);
+
+  try {
+    return await uploadPromise;
+  } finally {
+    // Clean up the in-flight tracker once complete (success or failure)
+    uploadPromises.delete(absPath);
+  }
 }
 
 // ------------------------------
@@ -203,16 +296,19 @@ async function uploadImageAsset(absPath) {
  */
 async function ensureAuthor({ authorId, author }) {
   if (authorId) {
-    const exists = await client.fetch(`*[_id==$id][0]{_id}`, { id: authorId });
+    const exists = await withRetry(
+      () => client.fetch(`*[_id==$id][0]{_id}`, { id: authorId }),
+      { context: `fetch author ${authorId}` }
+    );
     if (!exists?._id) throw new Error(`authorId not found: ${authorId}`);
     return authorId;
   }
 
   if (!author) throw new Error("Frontmatter must include 'author' (name) or 'authorId'.");
 
-  const existing = await client.fetch(
-    `*[_type=="author" && name==$name][0]{_id}`,
-    { name: author }
+  const existing = await withRetry(
+    () => client.fetch(`*[_type=="author" && name==$name][0]{_id}`, { name: author }),
+    { context: `fetch author by name "${author}"` }
   );
   if (existing?._id) return existing._id;
 
@@ -224,12 +320,15 @@ async function ensureAuthor({ authorId, author }) {
     return id;
   }
 
-  await client.createIfNotExists({
-    _id: id,
-    _type: "author",
-    name: author,
-    slug: { _type: "slug", current: s },
-  });
+  await withRetry(
+    () => client.createIfNotExists({
+      _id: id,
+      _type: "author",
+      name: author,
+      slug: { _type: "slug", current: s },
+    }),
+    { context: `create author "${author}"` }
+  );
 
   console.log(`  [create] author: ${author} -> ${id}`);
   return id;
@@ -526,6 +625,24 @@ function ensureKeys(ptBlocks) {
 }
 
 /**
+ * Block types to filter out during conversion.
+ * These are valid Portable Text but may not be in the target Sanity schema.
+ */
+const UNSUPPORTED_BLOCK_TYPES = new Set(["horizontal-rule"]);
+
+/**
+ * Filter out block types that aren't supported by the target Sanity schema.
+ */
+function filterUnsupportedBlocks(ptBlocks) {
+  return ptBlocks.filter((block) => {
+    if (UNSUPPORTED_BLOCK_TYPES.has(block?._type)) {
+      return false;
+    }
+    return true;
+  });
+}
+
+/**
  * Convert Markdown -> Portable Text, uploading inline images and replacing them with
  * Portable Text `image` blocks (alt/caption preserved), while preserving text formatting.
  */
@@ -537,6 +654,9 @@ async function markdownToPortableTextWithInlineImages(mdFilePath, markdown) {
 
   // Ensure all blocks have keys
   pt = ensureKeys(pt);
+
+  // Filter out unsupported block types (e.g., horizontal-rule)
+  pt = filterUnsupportedBlocks(pt);
 
   if (images.length === 0) return pt;
 
@@ -570,7 +690,7 @@ async function markdownToPortableTextWithInlineImages(mdFilePath, markdown) {
 
   // Replace tokens with image blocks and ensure all blocks have keys
   const result = replaceTokensWithImageBlocksPreserveMarks(pt, tokenToImageBlock);
-  return ensureKeys(result);
+  return filterUnsupportedBlocks(ensureKeys(result));
 }
 
 // ------------------------------
@@ -581,7 +701,7 @@ async function importFile(mdFilePath, index, total) {
   const filename = path.basename(mdFilePath);
   console.log(`\n[${index + 1}/${total}] ${filename}`);
 
-  const raw = fs.readFileSync(mdFilePath, "utf8");
+  const raw = readFileWithContext(mdFilePath, "markdown post", "utf8");
   const { data: fm, content } = matter(raw);
 
   validateFrontmatter(fm, mdFilePath);
@@ -645,7 +765,10 @@ async function importFile(mdFilePath, index, total) {
     return { dry: true, slug };
   }
 
-  await client.createOrReplace(doc);
+  await withRetry(
+    () => client.createOrReplace(doc),
+    { context: `upsert post "${slug}"` }
+  );
   console.log(`  [ok] upserted: ${docId}`);
   return { slug };
 }
