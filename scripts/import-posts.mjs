@@ -154,9 +154,11 @@ function validateImageType(absPath) {
 
 /**
  * Generate document ID with optional draft prefix.
+ * NOTE: Using dash separator, NOT dot. Dots are reserved for Sanity namespaces
+ * (e.g., drafts.) and cause documents to be invisible via the public API.
  */
 function makeDocumentId(type, slug) {
-  const baseId = `${type}.${slug}`;
+  const baseId = `${type}-${slug}`;
   return DRAFT ? `drafts.${baseId}` : baseId;
 }
 
